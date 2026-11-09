@@ -14,7 +14,10 @@ import io
 import json
 import os
 from pathlib import Path
+import re
+import shutil
 import struct
+import subprocess
 import sys
 import tempfile
 import threading
@@ -393,17 +396,78 @@ class ExecutionTests(unittest.TestCase):
 
 
 class SkillTests(unittest.TestCase):
+    def setUp(self):
+        self.skill_dir = SCRIPT.parents[1]
+
     def test_discoverable_frontmatter_and_bundled_script(self):
-        skill = SCRIPT.parents[1] / "SKILL.md"
+        skill = self.skill_dir / "SKILL.md"
         text = skill.read_text(encoding="utf-8")
+        self.assertTrue(text.startswith("---\n"))
         frontmatter = text.split("---", 2)[1]
         self.assertIn(f"name: {skill.parent.name}\n", frontmatter)
-        description = next(line.removeprefix("description: ") for line in frontmatter.splitlines() if line.startswith("description: "))
-        self.assertTrue(description.startswith("'") and description.endswith("'"))
-        self.assertLessEqual(len(description[1:-1]), 1024)
-        self.assertIn("uv run --script", text)
+        self.assertRegex(skill.parent.name, r"^[a-z0-9]+(?:-[a-z0-9]+)*$")
+        self.assertLessEqual(len(skill.parent.name), 64)
+        for field, limit in (("description", 1024), ("compatibility", 500)):
+            value = next(line.removeprefix(f"{field}: ") for line in frontmatter.splitlines() if line.startswith(f"{field}: "))
+            self.assertTrue(value.startswith("'") and value.endswith("'"))
+            self.assertGreater(len(value[1:-1].strip()), 0)
+            self.assertLessEqual(len(value[1:-1]), limit)
+        self.assertLess(len(text.splitlines()), 500)
+        self.assertIn("uv run --no-env-file --script", text)
         self.assertIn("./scripts/openai_image.py", text)
         self.assertIn("./tests/test_openai_image.py", text)
+
+    def test_document_links_stay_inside_bundle(self):
+        for document in self.skill_dir.rglob("*.md"):
+            for target in re.findall(r"\[[^\]]+\]\(([^)\s]+)\)", document.read_text(encoding="utf-8")):
+                if "://" in target or target.startswith("#"):
+                    continue
+                with self.subTest(document=document.name, target=target):
+                    resolved = (document.parent / target.split("#", 1)[0]).resolve()
+                    self.assertTrue(resolved.is_relative_to(self.skill_dir))
+                    self.assertTrue(resolved.is_file())
+
+    def test_codex_metadata_matches_skill(self):
+        metadata = (self.skill_dir / "agents" / "openai.yaml").read_text(encoding="utf-8")
+        self.assertTrue(metadata.startswith("interface:\n"))
+        fields = {}
+        for field in ("display_name", "short_description", "default_prompt"):
+            match = re.search(rf"^  {field}: (.+)$", metadata, re.MULTILINE)
+            self.assertIsNotNone(match)
+            assert match is not None
+            fields[field] = json.loads(match[1])
+            self.assertTrue(fields[field].strip())
+        self.assertGreaterEqual(len(fields["short_description"]), 25)
+        self.assertLessEqual(len(fields["short_description"]), 64)
+        self.assertIn(f"${self.skill_dir.name}", fields["default_prompt"])
+        self.assertIn("policy:\n  allow_implicit_invocation: true\n", metadata)
+
+    def test_environment_template_contains_no_key(self):
+        template = (self.skill_dir / "assets" / ".env.example").read_text(encoding="utf-8")
+        values = dict(line.split("=", 1) for line in template.splitlines() if line and not line.startswith("#"))
+        self.assertEqual(values["OPENAI_API_KEY"], "")
+        self.assertEqual(values["OPENAI_IMAGE_MODEL"], image.DEFAULT_MODEL)
+
+    def test_copied_bundle_runs_outside_repository(self):
+        with tempfile.TemporaryDirectory() as folder:
+            installed = Path(folder) / "installed skills" / self.skill_dir.name
+            shutil.copytree(self.skill_dir, installed, ignore=shutil.ignore_patterns("__pycache__", "*.pyc"))
+            working = Path(folder) / "unrelated project"
+            working.mkdir()
+            for output_format in ("png", "gif"):
+                with self.subTest(output_format=output_format):
+                    output_name = f"portable.{output_format}"
+                    result = subprocess.run(
+                        [sys.executable, str(installed / "scripts" / SCRIPT.name), "--prompt", "offline portability check", "--output", output_name, "--dry-run"],
+                        cwd=working, env=TEST_ENV, capture_output=True, text=True, encoding="utf-8", timeout=15,
+                    )
+                    self.assertEqual(result.returncode, 0, result.stderr)
+                    payload = json.loads(result.stdout)
+                    self.assertTrue(payload["dry_run"])
+                    self.assertEqual(payload["request"]["output_format"], output_format)
+                    self.assertEqual(Path(payload["output"]), working / output_name)
+                    self.assertFalse((working / output_name).exists())
+                    self.assertFalse((installed / output_name).exists())
 
 
 if __name__ == "__main__":

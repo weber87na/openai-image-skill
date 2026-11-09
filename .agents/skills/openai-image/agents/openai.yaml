@@ -1,0 +1,7 @@
+interface:
+  display_name: "OpenAI 繪圖與原生 GIF"
+  short_description: "透過 OpenAI Images API 產生靜態圖片與原生動畫 GIF"
+  default_prompt: "請使用 $openai-image 依照我的描述生成圖片或原生動畫 GIF，先確認參數與 API 費用授權。"
+
+policy:
+  allow_implicit_invocation: true
